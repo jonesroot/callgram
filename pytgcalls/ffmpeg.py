@@ -22,30 +22,6 @@ from .types.raw import AudioParameters
 from .types.raw import VideoParameters
 
 
-def run_subprocess_sync(command: List[str]) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(command, capture_output=True, timeout=20, check=True)
-    except subprocess.CalledProcessError as e:
-        raise FFmpegError(f"Subprocess error: {e.stderr.decode()}")
-    except FileNotFoundError:
-        raise FFmpegError(f"{command[0]} not installed")
-
-
-def run_subprocess_help_sync(command: str, process_name: Optional[str]) -> str:
-    try:
-        proc = subprocess.run(
-            [process_name or command, "-h"],
-            capture_output=True,
-            timeout=20,
-            check=True,
-        )
-        return proc.stdout.decode("utf-8")
-    except subprocess.CalledProcessError as e:
-        raise FFmpegError(f"Error getting help output: {e.stderr.decode()}")
-    except FileNotFoundError:
-        raise FFmpegError(f"{command} not installed")
-
-
 async def check_stream(
     ffmpeg_parameters: Optional[str],
     path: str,
@@ -55,55 +31,79 @@ async def check_stream(
 ):
     try:
         command = await cleanup_commands(
-            build_command("ffprobe", ffmpeg_parameters, path, stream_parameters, before_commands, headers, False)
+            build_command(
+                'ffprobe',
+                ffmpeg_parameters,
+                path,
+                stream_parameters,
+                before_commands,
+                headers,
+                False,
+            ),
         )
-        result = await asyncio.to_thread(run_subprocess_sync, command)
-        stdout = result.stdout
-        stderr = result.stderr
-    except Exception:
-        raise
+
+        loop = asyncio.get_running_loop()
+        proc_res = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ),
+        )
+    except FileNotFoundError:
+        raise FFmpegError('ffprobe not installed')
 
     try:
-        output = loads(stdout.decode("utf-8")) or {}
+        stdout: str = proc_res.stdout
+        stderr: str = proc_res.stderr
+        result = loads(stdout) or {}
+        stream_list = result.get('streams', [])
+        format_content = result.get('format', [])
+        if 'No such file' in stderr:
+            raise FileNotFoundError()
     except JSONDecodeError:
-        raise FFmpegError("Failed to parse ffprobe output")
-
-    stream_list = output.get("streams", [])
-    format_content = output.get("format", {})
-
-    if "No such file" in stderr.decode("utf-8"):
-        raise FileNotFoundError()
+        raise
 
     have_video = False
     is_image = False
     have_audio = False
     have_valid_video = False
+
     original_width, original_height = 0, 0
 
     for stream in stream_list:
-        codec_type = stream.get("codec_type", "")
-        codec_name = stream.get("codec_name", "")
-        if codec_type == "video":
-            is_image |= codec_name in ["png", "jpeg", "jpg", "mjpeg"]
+        codec_type = stream.get('codec_type', '')
+        codec_name = stream.get('codec_name', '')
+        image_codecs = ['png', 'jpeg', 'jpg', 'mjpeg']
+        if codec_type == 'video':
+            is_image = codec_name in image_codecs
             have_video = True
-            original_width = int(stream.get("width", 0))
-            original_height = int(stream.get("height", 0))
+            original_width = int(stream.get('width', 0))
+            original_height = int(stream.get('height', 0))
             if original_height and original_width:
                 have_valid_video = True
-        elif codec_type == "audio":
+        elif codec_type == 'audio':
             have_audio = True
 
     if isinstance(stream_parameters, VideoParameters):
         if not have_video:
             raise NoVideoSourceFound(path)
         if not have_valid_video:
-            raise InvalidVideoProportion("Video proportion not found")
+            raise InvalidVideoProportion(
+                'Video proportion not found',
+            )
 
         ratio = float(original_width) / original_height
         new_w = min(original_width, stream_parameters.width)
         new_h = int(new_w / ratio)
 
-        if new_h > stream_parameters.height and stream_parameters.adjust_by_height:
+        if (
+            new_h > stream_parameters.height and
+            stream_parameters.adjust_by_height
+        ):
             new_h = stream_parameters.height
             new_w = int(new_h * ratio)
 
@@ -111,7 +111,6 @@ async def check_stream(
         new_h = new_h - 1 if new_h % 2 else new_h
         stream_parameters.height = new_h
         stream_parameters.width = new_w
-
         if is_image:
             stream_parameters.frame_rate = 1
             raise ImageSourceFound(path)
@@ -119,7 +118,7 @@ async def check_stream(
     if isinstance(stream_parameters, AudioParameters) and not have_audio:
         raise NoAudioSourceFound(path)
 
-    if "duration" not in format_content:
+    if 'duration' not in format_content:
         raise LiveStreamFound(path)
 
 
@@ -128,19 +127,38 @@ async def cleanup_commands(
     process_name: Optional[str] = None,
     blacklist: Optional[List[str]] = None,
 ) -> List[str]:
-    result = await asyncio.to_thread(run_subprocess_help_sync, commands[0], process_name)
-    supported = re.findall(r"(?m)^ *(-.*?)\\s+", result)
-    new_commands = []
-    ignore_next = False
+    try:
+        loop = asyncio.get_running_loop()
+        cmd = [commands[0] if not process_name else process_name, '-h']
+        proc_res = await loop.run_in_executor(
+            None,
+            lambda: subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=20,
+            ),
+        )
+        try:
+            stdout: str = proc_res.stdout
+            result = stdout
+        except JSONDecodeError:
+            raise
+        supported = re.findall(r'(?m)^ *(-.*?)\s+', result)
+        new_commands = []
+        ignore_next = False
 
-    for v in commands:
-        if len(v) > 0:
-            if v[0] == "-":
-                ignore_next = v not in supported or (blacklist is not None and v in blacklist)
-            if not ignore_next:
-                new_commands.append(v)
-
-    return new_commands
+        for v in commands:
+            if len(v) > 0:
+                if v[0] == '-':
+                    ignore_next = v not in supported or \
+                        blacklist is not None and v in blacklist
+                if not ignore_next:
+                    new_commands += [v]
+        return new_commands
+    except FileNotFoundError:
+        raise FFmpegError(f'{commands[0]} not installed')
 
 
 def build_command(
@@ -196,12 +214,12 @@ def build_command(
     if headers is not None:
         for i in headers:
             ffmpeg_command.append('-headers')
-            ffmpeg_command.append(f'{i}: {headers[i]}')
+            ffmpeg_command.append(f'"{i}: {headers[i]}"')
 
     ffmpeg_command += [
         '-nostdin',
         '-i',
-        f'{path}' if name == 'ffmpeg' else path,
+        f'"{path}"' if name == 'ffmpeg' else path,
     ]
     ffmpeg_command += command['mid']
 
@@ -259,7 +277,7 @@ def _extract_stream_params(command: List[str]):
 def _build_ffmpeg_options(
         stream_parameters: Union[AudioParameters, VideoParameters],
 ) -> List[str]:
-    log_level = logging.getLogger('ffmpeg').level
+    log_level = logging.getLogger().level
     ffmpeg_level = 'info' if log_level == logging.DEBUG else 'quiet'
 
     options = ['-v', ffmpeg_level, '-f']
