@@ -2,15 +2,15 @@ import asyncio
 import logging
 import re
 import shlex
-from typing import Optional
-from typing import Tuple
+import subprocess
+from typing import Optional, Tuple
 
 from .exceptions import YtDlpError
 from .ffmpeg import cleanup_commands
 from .list_to_cmd import list_to_cmd
 from .types.raw import VideoParameters
 
-py_logger = logging.getLogger('pytgcalls')
+py_logger = logging.getLogger("pytgcalls")
 
 
 class YtDlp:
@@ -31,56 +31,56 @@ class YtDlp:
         video_parameters: VideoParameters,
         add_commands: Optional[str],
     ) -> Tuple[Optional[str], Optional[str]]:
-        if link is None:
+        if not link:
             return None, None
 
         commands = [
-            'yt-dlp',
-            '-g',
-            '-f',
+            "yt-dlp",
+            "-g",
+            "-f",
             'bestvideo[vcodec~="(vp09|avc1)"]+m4a/best',
-            '-S',
-            'res:'
-            f'{min(video_parameters.width, video_parameters.height)}',
-            '--no-warnings',
+            "-S",
+            f"res:{min(video_parameters.width, video_parameters.height)}",
+            "--no-warnings",
         ]
 
         if add_commands:
             commands += await cleanup_commands(
                 shlex.split(add_commands),
-                'yt-dlp',
-                [
-                    '-f',
-                    '-g',
-                    '--no-warnings',
-                ],
+                process_name="yt-dlp",
+                blacklist=["-f", "-g", "--no-warnings"],
             )
 
         commands.append(link)
+        command_str = list_to_cmd(commands)
+        py_logger.debug(f'Running yt-dlp command: {command_str}')
 
-        py_logger.log(
-            logging.DEBUG,
-            f'Running with "{list_to_cmd(commands)}" command',
-        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *commands,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    20,
+            def run_ytdlp():
+                return subprocess.run(
+                    commands,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    text=True,
+                    timeout=20,
                 )
-            except asyncio.TimeoutError:
-                proc.terminate()
-                raise YtDlpError('yt-dlp process timeout')
-            if stderr:
-                raise YtDlpError(stderr.decode())
-            data = stdout.decode().strip().split('\n')
-            if data:
-                return data[0], data[1] if len(data) >= 2 else data[0]
-            raise YtDlpError('No video URLs found')
+
+            result = await asyncio.to_thread(run_ytdlp)
+
+            if result.returncode != 0:
+                raise YtDlpError(result.stderr.strip())
+
+            output_lines = result.stdout.strip().split("\n")
+            if not output_lines:
+                raise YtDlpError("No video URLs found")
+
+            return (
+                output_lines[0],
+                output_lines[1] if len(output_lines) > 1 else output_lines[0],
+            )
+
+        except subprocess.TimeoutExpired:
+            raise YtDlpError("yt-dlp process timeout")
         except FileNotFoundError:
-            raise YtDlpError('yt-dlp is not installed on your system')
+            raise YtDlpError("yt-dlp is not installed on your system")
