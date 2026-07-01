@@ -2,8 +2,9 @@ import asyncio
 import logging
 import re
 import shlex
-import shutil
-from typing import Optional, Tuple, Dict, List
+import subprocess
+from typing import Optional
+from typing import Tuple
 
 from .exceptions import YtDlpError
 from .ffmpeg import cleanup_commands
@@ -13,91 +14,31 @@ from .types.raw import VideoParameters
 py_logger = logging.getLogger('pytgcalls')
 
 
-class YtDlpCache:
-    """
-    A simple cache to store URL extraction results in order to avoid...
-    repeated calls to yt-dlp that could trigger rate limits.
-    """
-    def __init__(self, ttl: float = 300.0):
-        self._cache: Dict[str, Tuple[float, Tuple[str, str]]] = {}
-        self._ttl = ttl
-
-    def get(self, key: str) -> Optional[Tuple[str, str]]:
-        if key in self._cache:
-            timestamp, value = self._cache[key]
-            if asyncio.get_event_loop().time() - timestamp < self._ttl:
-                return value
-            else:
-                del self._cache[key]
-        return None
-
-    def set(self, key: str, value: Tuple[str, str]) -> None:
-        self._cache[key] = (asyncio.get_event_loop().time(), value)
-
-    def clear(self) -> None:
-        self._cache.clear()
-
-
-# Initialize global cache for YtDlp instance
-_extractor_cache = YtDlpCache(ttl=300.0)
-
-
-async def _run_command_async(commands: List[str], timeout: float = 20.0) -> Tuple[int, str, str]:
-    """
-    Run system commands asynchronously using the native asyncio subprocess.
-    Reduce thread-switching overhead and handle timeouts safely.
-    """
-    if not shutil.which(commands[0]):
-        raise YtDlpError(f"Executable '{commands[0]}' was not found on the system.")
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            commands[0],
-            *commands[1:],
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                proc.communicate(), 
-                timeout=timeout
-            )
-            return proc.returncode or 0, stdout_bytes.decode('utf-8', errors='ignore'), stderr_bytes.decode('utf-8', errors='ignore')
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            await proc.wait()
-            raise TimeoutError("The yt-dlp process exceeded the specified time limit.")
-            
-    except Exception as e:
-        if not isinstance(e, TimeoutError):
-            raise YtDlpError(f"Failed to execute command: {str(e)}") from e
-        raise
-
-
 class YtDlp:
     """
-    A modern wrapper for yt-dlp that is efficient and resistant to blocking.
+    Modern YouTube-DL wrapper using asyncio.to_thread.
+
+    Compatible with Python 3.11+ and uvloop.
     """
-    # Regulation of expression covering YouTube Music, Shorts, mobile, etc.
+
     YOUTUBE_REGX = re.compile(
-        r'^(?:https?://)?(?:www\.|m\.|music\.)?'
-        r'(?:youtu\.be/|youtube(?:-nocookie)?\.com/'
-        r'(?:embed/|v/|watch\?v=|watch\?.+&v=|shorts/|live/))'
-        r'([\w-]{11})',
-        re.IGNORECASE
+        r'^((?:https?:)?//)?((?:www|m)\.)?'
+        r'(youtube(-nocookie)?\.com|youtu.be)'
+        r'(/(?:[\w\-]+\?v=|embed/|live/|v/)?)'
+        r'([\w\-]+)(\S+)?$',
     )
 
     @staticmethod
     def is_valid(link: str) -> bool:
         """
-        Validate whether the link is a valid YouTube URL.
+        Check if the provided link is a valid YouTube URL.
+
+        Args:
+            link: URL string to validate
+
+        Returns:
+            True if valid YouTube URL, False otherwise
         """
-        if not link:
-            return False
         return bool(YtDlp.YOUTUBE_REGX.match(link))
 
     @staticmethod
@@ -105,76 +46,120 @@ class YtDlp:
         link: Optional[str],
         video_parameters: VideoParameters,
         add_commands: Optional[str] = None,
-        use_cache: bool = True
     ) -> Tuple[Optional[str], Optional[str]]:
         """
-        Extracting audio and video URLs from YouTube links using yt-dlp.
+        Extract video and audio URLs from YouTube link using yt-dlp.
+
+        Modern implementation using asyncio.to_thread instead of create_subprocess_exec.
+
+        Args:
+            link: YouTube video URL
+            video_parameters: Video parameters for quality selection
+            add_commands: Additional yt-dlp commands (optional)
+
+        Returns:
+            Tuple of (video_url, audio_url) or (None, None) if link is None
+
+        Raises:
+            YtDlpError: If yt-dlp fails or is not installed
+            TimeoutError: If extraction takes too long
         """
-        if not link:
+        if link is None:
             return None, None
 
-        if not YtDlp.is_valid(link):
-            raise YtDlpError("Invalid YouTube link format")
-
-        cache_key = f"{link}_{video_parameters.width}x{video_parameters.height}_{add_commands or ''}"
-        if use_cache:
-            cached_res = _extractor_cache.get(cache_key)
-            if cached_res:
-                py_logger.debug(f"Using the extracted results from the cache to: {link}")
-                return cached_res
-
-        max_res = min(video_parameters.width, video_parameters.height)
         commands = [
             'yt-dlp',
             '-g',
-            '-f', f'bestvideo[height<={max_res}][vcodec~="(vp09|avc1)"]+bestaudio/best',
+            '-f',
+            'bestvideo[vcodec~="(vp09|avc1)"]+m4a/best',
+            '-S',
+            f'res:{min(video_parameters.width, video_parameters.height)}',
             '--no-warnings',
         ]
 
         if add_commands:
-            cleaned = await cleanup_commands(
+            commands += await cleanup_commands(
                 shlex.split(add_commands),
                 'yt-dlp',
                 ['-f', '-g', '--no-warnings'],
             )
-            commands.extend(cleaned)
 
         commands.append(link)
 
-        py_logger.debug(f'Executing command: "{list_to_cmd(commands)}"')
+        py_logger.log(
+            logging.DEBUG,
+            f'Running with "{list_to_cmd(commands)}" command',
+        )
 
         try:
-            returncode, stdout, stderr = await _run_command_async(commands, timeout=25.0)
+            async with asyncio.timeout(20):
+                result = await asyncio.to_thread(
+                    _run_ytdlp,
+                    commands,
+                )
 
-            if returncode != 0:
-                error_msg = stderr.strip() if stderr else 'Unknown error'
-                raise YtDlpError(f"yt-dlp error: {error_msg}")
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() if result.stderr else 'Unknown error'
+                raise YtDlpError(error_msg)
 
-            data = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+            data = result.stdout.strip().split('\n')
 
-            if not data:
-                raise YtDlpError('Stream URL not found in yt-dlp output.')
+            if not data or not data[0]:
+                raise YtDlpError('No video URLs found')
 
-            # yt-dlp returns the video on the first line and the audio on the second line (if separate).
             video_url = data[0]
             audio_url = data[1] if len(data) >= 2 else data[0]
 
-            result = (video_url, audio_url)
-            if use_cache:
-                _extractor_cache.set(cache_key, result)
+            return video_url, audio_url
 
-            return result
+        except FileNotFoundError as e:
+            raise YtDlpError('yt-dlp is not installed on your system') from e
+        except subprocess.TimeoutExpired:
+            raise YtDlpError('yt-dlp process timeout')
+        except TimeoutError:
+            raise YtDlpError('yt-dlp process timeout (asyncio)')
 
-        except TimeoutError as e:
-            raise YtDlpError("yt-dlp search timed out") from e
+
+def _run_ytdlp(commands: list) -> subprocess.CompletedProcess:
+    """
+    Synchronous wrapper for yt-dlp execution.
+
+    Designed to be used with asyncio.to_thread for non-blocking operation.
+
+    Args:
+        commands: List of command arguments
+
+    Returns:
+        CompletedProcess instance with stdout and stderr
+
+    Raises:
+        FileNotFoundError: If yt-dlp is not installed
+        subprocess.TimeoutExpired: If command times out
+    """
+    return subprocess.run(
+        commands,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
 
 
 class YtDlpBatch:
     """
-    YouTube batch extractor with concurrency management (semaphore).
+    Batch YouTube URL extractor with concurrency control.
+
+    Useful for extracting multiple videos simultaneously with rate limiting.
     """
 
     def __init__(self, max_concurrent: int = 3):
+        """
+        Initialize batch extractor.
+
+        Args:
+            max_concurrent: Maximum number of concurrent extractions
+        """
+        self.max_concurrent = max_concurrent
         self.semaphore = asyncio.Semaphore(max_concurrent)
 
     async def extract_one(
@@ -184,7 +169,15 @@ class YtDlpBatch:
         add_commands: Optional[str] = None,
     ) -> Tuple[Optional[str], Optional[str], Optional[Exception]]:
         """
-        Extracting a single link under Semaphore supervision.
+        Extract single video with semaphore control.
+
+        Args:
+            link: YouTube video URL
+            video_parameters: Video parameters
+            add_commands: Additional yt-dlp commands
+
+        Returns:
+            Tuple of (video_url, audio_url, error)
         """
         async with self.semaphore:
             try:
@@ -199,18 +192,28 @@ class YtDlpBatch:
 
     async def extract_many(
         self,
-        links: List[str],
+        links: list[str],
         video_parameters: VideoParameters,
         add_commands: Optional[str] = None,
-    ) -> List[Tuple[Optional[str], Optional[str], Optional[Exception]]]:
+    ) -> list[Tuple[Optional[str], Optional[str], Optional[Exception]]]:
         """
-        Safely extract multiple links concurrently.
+        Extract multiple videos concurrently.
+
+        Args:
+            links: List of YouTube video URLs
+            video_parameters: Video parameters
+            add_commands: Additional yt-dlp commands
+
+        Returns:
+            List of (video_url, audio_url, error) tuples
         """
         tasks = [
             self.extract_one(link, video_parameters, add_commands)
             for link in links
         ]
-        return await asyncio.gather(*tasks)
+
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return results
 
 
 async def extract_with_retry(
@@ -221,7 +224,20 @@ async def extract_with_retry(
     retry_delay: float = 2.0,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    URL extraction with automatic recovery/retry mechanism.
+    Extract YouTube URLs with automatic retry on failure.
+
+    Args:
+        link: YouTube video URL
+        video_parameters: Video parameters
+        add_commands: Additional yt-dlp commands
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+
+    Returns:
+        Tuple of (video_url, audio_url)
+
+    Raises:
+        YtDlpError: If all retry attempts fail
     """
     last_error = None
 
@@ -232,14 +248,16 @@ async def extract_with_retry(
             last_error = e
             if attempt < max_retries - 1:
                 py_logger.warning(
-                    f"Attempt {attempt + 1} failed: {e}. "
-                    f"Retrying in {retry_delay} seconds .."
+                    f"yt-dlp attempt {attempt + 1} failed: {e}. "
+                    f"Retrying in {retry_delay}s..."
                 )
                 await asyncio.sleep(retry_delay)
             else:
-                py_logger.error(f"Failed to extract after {max_retries} attempts: {e}")
+                py_logger.error(
+                    f"yt-dlp failed after {max_retries} attempts: {e}"
+                )
 
-    raise last_error if last_error else YtDlpError("Failed to process the link")
+    raise last_error if last_error else YtDlpError("Unknown error")
 
 
 async def extract_with_fallback_formats(
@@ -248,10 +266,23 @@ async def extract_with_fallback_formats(
     add_commands: Optional[str] = None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
-    Try extracting using various format combinations step-by-step if it fails.
+    Extract YouTube URLs with fallback to different format options.
+
+    Tries multiple format strings if the first one fails.
+
+    Args:
+        link: YouTube video URL
+        video_parameters: Video parameters
+        add_commands: Additional yt-dlp commands
+
+    Returns:
+        Tuple of (video_url, audio_url)
+
+    Raises:
+        YtDlpError: If all format options fail
     """
     format_options = [
-        'bestvideo[vcodec~="(vp09|avc1)"]+bestaudio/best',
+        'bestvideo[vcodec~="(vp09|avc1)"]+m4a/best',
         'bestvideo+bestaudio/best',
         'best',
     ]
@@ -261,17 +292,24 @@ async def extract_with_fallback_formats(
             custom_commands = f'-f {fmt}'
             if add_commands:
                 custom_commands += f' {add_commands}'
-            return await YtDlp.extract(link, video_parameters, custom_commands, use_cache=False)
+            return await YtDlp.extract(link, video_parameters, custom_commands)
+
         except YtDlpError as e:
-            py_logger.debug(f"Alternative format '{fmt}' failed: {e}")
+            py_logger.debug(f"Format '{fmt}' failed: {e}")
             continue
 
-    raise YtDlpError("All streaming format options failed to extract.")
+    raise YtDlpError("All format options failed")
 
 
 def is_playlist(link: str) -> bool:
     """
-    Checks whether the provided link detects a YouTube playlist.
+    Check if the link is a YouTube playlist.
+
+    Args:
+        link: URL to check
+
+    Returns:
+        True if link is a playlist
     """
     playlist_patterns = [
         r'[?&]list=',
@@ -283,9 +321,19 @@ def is_playlist(link: str) -> bool:
 async def extract_playlist_urls(
     playlist_link: str,
     max_videos: Optional[int] = None,
-) -> List[str]:
+) -> list[str]:
     """
-    Extracts a list of individual video URLs from a YouTube playlist.
+    Extract individual video URLs from a YouTube playlist.
+
+    Args:
+        playlist_link: YouTube playlist URL
+        max_videos: Maximum number of videos to extract (None for all)
+
+    Returns:
+        List of video URLs
+
+    Raises:
+        YtDlpError: If extraction fails
     """
     commands = [
         'yt-dlp',
@@ -300,13 +348,20 @@ async def extract_playlist_urls(
     commands.append(playlist_link)
 
     try:
-        returncode, stdout, stderr = await _run_command_async(commands, timeout=35.0)
+        async with asyncio.timeout(30):
+            result = await asyncio.to_thread(
+                subprocess.run,
+                commands,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
 
-        if returncode != 0:
-            raise YtDlpError(stderr.strip() if stderr else 'Failed to process playlist')
+        if result.returncode != 0:
+            raise YtDlpError(result.stderr or 'Failed to extract playlist')
 
-        video_ids = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
-        
+        video_ids = result.stdout.strip().split('\n')
         video_urls = [
             f'https://www.youtube.com/watch?v={vid_id}'
             for vid_id in video_ids if vid_id
@@ -314,5 +369,7 @@ async def extract_playlist_urls(
 
         return video_urls
 
-    except TimeoutError as e:
-        raise YtDlpError("Playlist extraction timed out.") from e
+    except FileNotFoundError as e:
+        raise YtDlpError('yt-dlp is not installed on your system') from e
+    except (subprocess.TimeoutExpired, TimeoutError):
+        raise YtDlpError('yt-dlp playlist extraction timeout')
